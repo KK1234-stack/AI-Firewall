@@ -1,10 +1,11 @@
 # dpi_firewall.py
 
 from netfilterqueue import NetfilterQueue
-from scapy.all import IP, TCP, UDP, Raw, IPv6
-from scapy.layers.tls.handshake import TLSClientHello
-from scapy.layers.tls.record import TLS # TLS record layer from scapy.all import IP, TCP, UDP, Raw, IPv6, TLS, TLSClientHello # Added TLS for future JA3
+from scapy.all import IP, TCP, UDP, Raw, IPv6 # Keep essential Scapy layers
+from scapy.layers.tls.handshake import TLSClientHello # Specific import for ClientHello
+from scapy.layers.tls.record import TLS # Specific import for TLS record layer
 import re # For regex pattern matching
+import hashlib # For MD5 hash calculation (for JA3)
 
 # --- Configuration: Define your blocking rules and DPI patterns ---
 
@@ -36,8 +37,58 @@ MALICIOUS_REGEX_PATTERNS = [
 # JA3: Known Malicious JA3 Hashes (Conceptual for now, will be populated later)
 # These are hashes derived from TLS Client Hello packets of known malicious clients
 KNOWN_MALICIOUS_JA3_HASHES = [
-    # "d41d8cd98f00b204e9800998ecf8427e", # Example placeholder hash
+    # "2835f8d66572f8a8474d22165f1712a3", # Example: Placeholder for a known malware JA3 (replace with real ones!)
+    # "0c9304953997f7d45f7457a4143a41b5", # Another placeholder
 ]
+
+# --- Helper function to calculate JA3 hash from a Scapy TLSClientHello layer ---
+def calculate_ja3_hash(tls_client_hello_layer):
+    """
+    Calculates the JA3 hash from a Scapy TLSClientHello layer.
+    This implementation tries to be accurate but might need adjustments for
+    all edge cases of Scapy's TLS parsing.
+    """
+    try:
+        tls_version = int(tls_client_hello_layer.version) if hasattr(tls_client_hello_layer, 'version') else 0
+        
+        # Cipher Suites (sorted numerically)
+        ciphers = sorted([int(c) for c in tls_client_hello_layer.ciphers]) if hasattr(tls_client_hello_layer, 'ciphers') and tls_client_hello_layer.ciphers else []
+
+        # Extensions: Extract relevant data for JA3
+        extensions_types = []
+        elliptic_curves = []
+        elliptic_curve_point_formats = []
+
+        if hasattr(tls_client_hello_layer, 'ext') and tls_client_hello_layer.ext:
+            for ext in tls_client_hello_layer.ext:
+                if hasattr(ext, 'type'):
+                    extensions_types.append(int(ext.type))
+                
+                # Check for Supported Groups (Elliptic Curves) extension - type 10
+                if ext.type == 10 and hasattr(ext, 'groups'):
+                    elliptic_curves = sorted([int(g) for g in ext.groups])
+                
+                # Check for EC Point Formats extension - type 11
+                elif ext.type == 11 and hasattr(ext, 'ecpl'):
+                    elliptic_curve_point_formats = sorted([int(p) for p in ext.ecpl])
+        
+        # Sort extension types numerically
+        extensions_types = sorted(list(set(extensions_types))) # Use set to handle potential duplicates, then sort
+
+        # Construct the JA3 components string
+        ja3_str = []
+        ja3_str.append(str(tls_version))
+        ja3_str.append("-".join(str(c) for c in ciphers))
+        ja3_str.append("-".join(str(t) for t in extensions_types))
+        ja3_str.append("-".join(str(ec) for ec in elliptic_curves))
+        ja3_str.append("-".join(str(ecpf) for ecpf in elliptic_curve_point_formats))
+
+        final_ja3_string = ",".join(ja3_str)
+        ja3_hash = hashlib.md5(final_ja3_string.encode('ascii')).hexdigest()
+        return ja3_hash
+    except Exception as e:
+        print(f"[-] Error in calculate_ja3_hash: {e}")
+        return None
 
 
 # --- Packet Handling Function ---
@@ -79,7 +130,7 @@ def packet_handler(pkt):
     if scapy_packet.haslayer(Raw):
         payload = scapy_packet[Raw].load
 
-    # --- Phase 1: Basic IP and Port Filtering (Moved from basic_firewall.py) ---
+    # --- Phase 1: Basic IP and Port Filtering ---
     if src_ip in BLOCKED_IPS:
         print(f"BLOCKING (IP): Source IP {src_ip} is on the blacklist.")
         pkt.drop()
@@ -111,14 +162,12 @@ def packet_handler(pkt):
             print(f"[-] Error decoding payload for regex search: {e}")
 
     # --- Phase 2: DPI - Basic HTTP Payload Parsing ---
-    # This is a very simplistic HTTP detection. For robust parsing, consider dedicated libraries.
     if proto == "TCP" and (dst_port == 80 or src_port == 80): # Standard HTTP port
         try:
             http_data = payload.decode('utf-8', errors='ignore')
             if http_data.startswith("GET ") or http_data.startswith("POST ") or \
                http_data.startswith("HTTP/"): # Basic check for HTTP request/response
                 print("[*] Detected HTTP traffic.")
-                # Example: Block specific User-Agents or suspicious paths
                 if "User-Agent: Nikto" in http_data: # Nikto is a web server scanner
                     print("BLOCKING (DPI-HTTP): Detected Nikto User-Agent.")
                     pkt.drop()
@@ -130,30 +179,42 @@ def packet_handler(pkt):
         except Exception as e:
             print(f"[-] Error parsing HTTP payload: {e}")
 
-    # --- Phase 2: DPI - JA3 TLS Fingerprinting (Conceptual/Placeholder) ---
-    # This is a more advanced part and often requires deeper TLS protocol understanding.
-    # Scapy can parse some TLS layers, but for full JA3 calculation, it's complex without specialized tools.
-    # We will expand on this when we actually implement JA3.
-    if TLS in scapy_packet or (proto == "TCP" and (dst_port == 443 or src_port == 443)):
-        # Check if it's a TLS Client Hello message (simplified check)
-        if scapy_packet.haslayer(TLSClientHello):
-            print("[*] Detected TLS Client Hello handshake.")
-            # In a real scenario, you'd extract fields and compute JA3 hash here.
-            # Example (conceptual):
-            # ja3_hash = calculate_ja3_from_scapy_tls_client_hello(scapy_packet[TLSClientHello])
-            # if ja3_hash in KNOWN_MALICIOUS_JA3_HASHES:
-            #     print(f"BLOCKING (JA3): Detected known malicious JA3 hash: {ja3_hash}")
-            #     pkt.drop()
-            #     return
-            print("[*] JA3 Fingerprinting logic needs full implementation in Phase 2 advanced.")
-
+    # --- Phase 2: DPI - JA3 TLS Fingerprinting ---
+    # Scapy's TLS layers must be loaded for TLSClientHello to be recognized.
+    # This is done by load_layer("tls") in run_firewall().
+    if TLSClientHello in scapy_packet: # Check specifically for the Client Hello layer
+        print("[*] Detected TLS Client Hello handshake.")
+        try:
+            ja3_hash = calculate_ja3_hash(scapy_packet[TLSClientHello])
+            if ja3_hash: # Only proceed if hash was calculated successfully
+                print(f"[*] Calculated JA3 Hash: {ja3_hash}")
+                if ja3_hash in KNOWN_MALICIOUS_JA3_HASHES:
+                    print(f"BLOCKING (JA3): Detected known malicious JA3 hash: {ja3_hash}")
+                    pkt.drop()
+                    return
+            else:
+                print("[-] JA3 hash calculation failed for this packet.")
+        except Exception as e:
+            print(f"[-] Error in JA3 processing: {e}")
+            # Decide: accept or drop on error? Generally accept to not block good traffic
+    elif TLS in scapy_packet: # Other TLS records (not ClientHello)
+        print("[*] Detected other TLS traffic.")
 
     # If no blocking rules are matched, accept the packet
     print(f"ACCEPTING packet from {src_ip}:{src_port} to {dst_ip}:{dst_port}.")
     pkt.accept()
 
+
 # --- Main Firewall Execution Logic ---
 def run_firewall():
+    # IMPORTANT: Load the TLS layer for Scapy to recognize TLS packets
+    from scapy.all import load_layer # Import load_layer specifically here
+    try:
+        load_layer("tls")
+        print("[*] Scapy TLS layer loaded successfully for JA3.")
+    except Exception as e:
+        print(f"[-] Warning: Could not load Scapy TLS layer: {e}. TLS/JA3 features might not work correctly.")
+
     nfqueue = NetfilterQueue()
     try:
         nfqueue.bind(0, packet_handler)
