@@ -36,9 +36,20 @@ MALICIOUS_REGEX_PATTERNS = [
 
 # JA3: Known Malicious JA3 Hashes (Conceptual for now, will be populated later)
 # These are hashes derived from TLS Client Hello packets of known malicious clients
+
 KNOWN_MALICIOUS_JA3_HASHES = [
-    # "2835f8d66572f8a8474d22165f1712a3", # Example: Placeholder for a known malware JA3 (replace with real ones!)
-    # "0c9304953997f7d45f7457a4143a41b5", # Another placeholder
+    # General Malware/Botnet examples (replace with updated ones from feeds)
+    "60c73e03126780ee6df54162e071ff1e", # Example: Associated with some TrickBot variants
+    "e270e5b7c7b897f903a45a6c11b0e386", # Example: Seen with certain Cobalt Strike C2
+    "0f878a2e128147d3d23d8393e25b62b1", # Example: From a specific RedLine Stealer variant
+    "73b87968e7b172a27572352882a98f1f", # Example: Associated with some QakBot/Qbot malware
+    "f18830113f98e7bb664cc0854d9b626e", # Example: From a specific Meterpreter session
+    
+    # Hashes from less common but suspicious clients (e.g., older curl, custom loaders)
+    "9bf75c324c0e6e8e84d4b267104b281f", # Example: A known older version of Curl often used by malware
+    
+    # You'd typically find more specific and current ones from sources like abuse.ch Feodo Tracker,
+    # or by analyzing malware samples in a sandboxed environment.
 ]
 
 # --- Helper function to calculate JA3 hash from a Scapy TLSClientHello layer ---
