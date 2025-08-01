@@ -6,6 +6,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
+# Import StratifiedKFold
+from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.utils import resample
 import joblib
 
@@ -112,48 +114,72 @@ def train_models():
     X = df.drop('Label', axis=1)
     y = df['Label']
 
-    numeric_cols = X.select_dtypes(include=np.number).columns.tolist()
-    X = X[numeric_cols]
+    # --- Corrected placement for FINAL_FEATURE_COLUMNS ---
+    numeric_cols_final = X.select_dtypes(include=np.number).columns.tolist()
+    print(f"\nFINAL FEATURE COLUMNS (ORDER MATTERS): {numeric_cols_final}\n")
+    # --- END Corrected placement ---
+
+    # Ensure X only contains numeric columns (should already be due to previous step)
+    X = X[numeric_cols_final]
     print(f"[*] Final feature set shape after preprocessing: {X.shape}")
     print(f"[*] Final label set shape: {y.shape}")
 
-    # --- 3. Split Data into Training and Testing Sets ---
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y)
-    print(f"[*] Data split: Train {X_train.shape}, Test {X_test.shape}")
+    # --- Cross-Validation Setup ---
+    # Using StratifiedKFold to maintain class proportions in each fold
+    cv = StratifiedKFold(n_splits=5, shuffle=True,
+                         random_state=42)  # 5 folds is common
 
-    # --- 4. Model Training and Evaluation ---
-    print("\n[*] Training Machine Learning Models...")
+    # --- 4. Model Training and Evaluation with Cross-Validation ---
+    print("\n[*] Training Machine Learning Models (with Cross-Validation for robust evaluation)...")
 
-    print("\n--- Random Forest Classifier ---")
+    # --- Random Forest Classifier Cross-Validation ---
+    print("\n--- Random Forest Classifier (Cross-Validation) ---")
+    rf_model_cv_eval = RandomForestClassifier(
+        n_estimators=50, max_depth=15, random_state=42, n_jobs=-1)
+
+    # Use cross_val_score to get accuracy scores for each fold
+    scores_rf = cross_val_score(
+        rf_model_cv_eval, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
+    # Mean accuracy with 95% confidence interval
+    print(
+        f"RF CV Accuracy: {scores_rf.mean():.4f} (+/- {scores_rf.std() * 2:.4f})")
+
+    # No need for y_test and y_pred_rf metrics here, as CV handles validation internally.
+    # We will train the final model on the full X, y later.
+
+    # --- Logistic Regression Cross-Validation ---
+    print("\n--- Logistic Regression (Cross-Validation) ---")
+    # Scale the full X data before passing to cross_val_score for Logistic Regression
+    scaler_cv_eval = StandardScaler()
+    X_scaled_cv_eval = scaler_cv_eval.fit_transform(X)
+
+    lr_model_cv_eval = LogisticRegression(
+        random_state=42, solver='liblinear', n_jobs=1)
+    scores_lr = cross_val_score(
+        lr_model_cv_eval, X_scaled_cv_eval, y, cv=cv, scoring='accuracy', n_jobs=-1)
+    print(
+        f"LR CV Accuracy: {scores_lr.mean():.4f} (+/- {scores_lr.std() * 2:.4f})")
+
+    # --- 5. Train Final Models on Full Data and Save ---
+    # After robust evaluation with CV, train the final models on the entire processed dataset (X, y)
+    # This is the model that will be used in your firewall.
+    print(
+        "\n[*] Training final models on the entire processed dataset for deployment...")
+
+    # Random Forest Final Model
     rf_model = RandomForestClassifier(
         n_estimators=50, max_depth=15, random_state=42, n_jobs=-1)
-    rf_model.fit(X_train, y_train)
-    y_pred_rf = rf_model.predict(X_test)
+    rf_model.fit(X, y)  # Train on full data
+    print("[*] Final Random Forest model trained.")
 
-    print("Random Forest Accuracy:", accuracy_score(y_test, y_pred_rf))
-    print("Random Forest Classification Report:\n",
-          classification_report(y_test, y_pred_rf, zero_division=0))
-    print("Random Forest Confusion Matrix:\n",
-          confusion_matrix(y_test, y_pred_rf))
-
-    print("\n--- Logistic Regression ---")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
+    # Logistic Regression Final Model
+    scaler = StandardScaler()  # Create a new scaler for the final model
+    X_scaled_final = scaler.fit_transform(X)  # Fit scaler on full data
     lr_model = LogisticRegression(
         random_state=42, solver='liblinear', n_jobs=1)
-    lr_model.fit(X_train_scaled, y_train)
-    y_pred_lr = lr_model.predict(X_test_scaled)
+    lr_model.fit(X_scaled_final, y)  # Train on full data
+    print("[*] Final Logistic Regression model trained.")
 
-    print("Logistic Regression Accuracy:", accuracy_score(y_test, y_pred_lr))
-    print("Logistic Regression Classification Report:\n",
-          classification_report(y_test, y_pred_lr, zero_division=0))
-    print("Logistic Regression Confusion Matrix:\n",
-          confusion_matrix(y_test, y_pred_lr))
-
-    # --- 5. Save Trained Models and Scaler ---
     print("\n[*] Saving trained models and scaler...")
     MODEL_DIR = './trained_models'
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -161,6 +187,7 @@ def train_models():
     joblib.dump(rf_model, os.path.join(MODEL_DIR, 'random_forest_model.pkl'))
     joblib.dump(lr_model, os.path.join(
         MODEL_DIR, 'logistic_regression_model.pkl'))
+    # Save this scaler as it's needed for LR inference
     joblib.dump(scaler, os.path.join(MODEL_DIR, 'scaler.pkl'))
     print(f"Models and scaler saved to {MODEL_DIR}/")
 
