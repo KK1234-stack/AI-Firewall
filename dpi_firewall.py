@@ -1,4 +1,4 @@
-# dpi_firewall.py - AI-Enhanced Deep Packet Inspection Firewall
+# dpi_firewall.py - Corrected extract_ml_features
 
 from netfilterqueue import NetfilterQueue
 from scapy.all import IP, TCP, UDP, Raw, IPv6
@@ -7,12 +7,12 @@ from scapy.layers.tls.record import TLS
 import re
 import hashlib
 import time
-import joblib  # For loading ML models
-import numpy as np  # For numerical operations, especially feature extraction
-import pandas as pd  # To create DataFrame for single packet features
+import joblib
+import numpy as np
+import pandas as pd
+import math  # Make sure this is imported at the top level for calculate_entropy
 
-# --- Configuration ---
-
+# --- Configuration (unchanged) ---
 BLOCKED_IPS = [
     "8.8.8.8",
     "192.168.1.100"
@@ -67,7 +67,7 @@ ML_FEATURE_COLUMNS = [
     'Active Min', 'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
 ]
 
-# --- Helper Functions ---
+# --- Helper Functions (unchanged) ---
 
 
 def calculate_ja3_hash(tls_client_hello_layer):
@@ -118,7 +118,7 @@ def calculate_entropy(data):
     data_len = len(data)
     for freq in frequencies.values():
         p = float(freq) / data_len
-        entropy -= p * math.log2(p)  # math.log2 needed
+        entropy -= p * math.log2(p)
     return entropy
 
 
@@ -140,88 +140,125 @@ def load_ml_models():
         LR_MODEL = None
         SCALER = None
 
+# --- CRITICALLY UPDATED extract_ml_features function ---
+
 
 def extract_ml_features(scapy_packet):
     """
     Extracts numerical features from a Scapy packet, matching the format
     expected by the trained ML models. This function must mirror the
     preprocessing logic in train_firewall_model.py exactly.
+
+    Note: Many features are flow-based (e.g., Flow Duration, IATs, Tot Fwd Pkts).
+    For a single packet, these will be approximated or set to 0.0/1.0.
+    The model's accuracy on real-time single packets will depend on how
+    much it relies on these flow-based features vs. packet-level ones.
     """
-    features = pd.Series(0.0, index=ML_FEATURE_COLUMNS,
-                         dtype=float)  # Initialize with zeros for all expected features
+    # Initialize all features to 0.0 using a Pandas Series for easy column management
+    features_dict = {col: 0.0 for col in ML_FEATURE_COLUMNS}
 
-    # Extract base IP/TCP/UDP features
+    # Extract IP-layer features
     if IP in scapy_packet:
-        # Placeholder - real flow duration needs flow tracking
-        features['Flow Duration'] = scapy_packet.time
-        features['Tot Fwd Pkts'] = 1  # Placeholder
-        features['Tot Bwd Pkts'] = 0  # Placeholder
+        features_dict['Protocol'] = scapy_packet[IP].proto
+        features_dict['Fwd Header Len'] = scapy_packet[IP].ihl * 4
+        features_dict['Pkt Len Min'] = scapy_packet[IP].len
+        features_dict['Pkt Len Max'] = scapy_packet[IP].len
+        features_dict['Pkt Len Mean'] = scapy_packet[IP].len
+        features_dict['Pkt Len Std'] = 0.0
+        features_dict['Pkt Len Var'] = 0.0
 
-        # Packet Lengths
-        features['Fwd Pkt Len Max'] = scapy_packet[IP].len
-        features['Fwd Pkt Len Min'] = scapy_packet[IP].len
-        features['Fwd Pkt Len Mean'] = scapy_packet[IP].len
-        features['Fwd Pkt Len Std'] = 0  # Single packet, std is 0
-        features['Bwd Pkt Len Max'] = 0
-        features['Bwd Pkt Len Min'] = 0
-        features['Bwd Pkt Len Mean'] = 0
-        features['Bwd Pkt Len Std'] = 0
-        features['Pkt Len Min'] = scapy_packet[IP].len
-        features['Pkt Len Max'] = scapy_packet[IP].len
-        features['Pkt Len Mean'] = scapy_packet[IP].len
-        features['Pkt Len Std'] = 0
-        features['Pkt Len Var'] = 0  # Single packet, variance is 0
+        # Simple single-packet approximations for flow-based counts/lengths
+        features_dict['Tot Fwd Pkts'] = 1.0  # This packet
+        features_dict['TotLen Fwd Pkts'] = scapy_packet[IP].len
+        features_dict['Fwd Pkt Len Max'] = scapy_packet[IP].len
+        features_dict['Fwd Pkt Len Min'] = scapy_packet[IP].len
+        features_dict['Fwd Pkt Len Mean'] = scapy_packet[IP].len
 
-        features['Fwd Header Len'] = scapy_packet[IP].ihl * 4
-        # Not applicable for single forward packet
-        features['Bwd Header Len'] = 0
+        # Initial window bytes are from TCP/UDP, other packet lengths are also based on payload
 
-        features['Protocol'] = scapy_packet[IP].proto
+        # For flow duration and IATs, in a single-packet context, they are often 0 or very small
+        # The model was trained on dataset-derived flow durations, so these are approximations.
+        features_dict['Flow Duration'] = 0.0
+        features_dict['Flow IAT Mean'] = 0.0
+        features_dict['Flow IAT Std'] = 0.0
+        features_dict['Flow IAT Max'] = 0.0
+        features_dict['Flow IAT Min'] = 0.0
+        features_dict['Fwd IAT Tot'] = 0.0
+        features_dict['Fwd IAT Mean'] = 0.0
+        features_dict['Fwd IAT Std'] = 0.0
+        features_dict['Fwd IAT Max'] = 0.0
+        features_dict['Fwd IAT Min'] = 0.0
+        features_dict['Bwd IAT Tot'] = 0.0
+        features_dict['Bwd IAT Mean'] = 0.0
+        features_dict['Bwd IAT Std'] = 0.0
+        features_dict['Bwd IAT Max'] = 0.0
+        features_dict['Bwd IAT Min'] = 0.0
 
+        # Other header lengths (Bwd Header Len) are 0 for a forward-only packet
+        features_dict['Bwd Header Len'] = 0.0
+
+    # Extract TCP/UDP layer features
     if TCP in scapy_packet:
-        features['Dst Port'] = scapy_packet[TCP].dport
-        # Not in ML_FEATURE_COLUMNS, for internal logic only
-        features['Src Port'] = scapy_packet[TCP].sport
-
+        features_dict['Dst Port'] = scapy_packet[TCP].dport
         # TCP Flags
-        features['FIN Flag Cnt'] = 1 if scapy_packet[TCP].flags.F else 0
-        features['SYN Flag Cnt'] = 1 if scapy_packet[TCP].flags.S else 0
-        features['RST Flag Cnt'] = 1 if scapy_packet[TCP].flags.R else 0
-        features['PSH Flag Cnt'] = 1 if scapy_packet[TCP].flags.P else 0
-        features['ACK Flag Cnt'] = 1 if scapy_packet[TCP].flags.A else 0
-        features['URG Flag Cnt'] = 1 if scapy_packet[TCP].flags.U else 0
-        # CWE Flag (ECN CWR)
-        features['CWE Flag Count'] = 1 if scapy_packet[TCP].flags.C else 0
-        # ECE Flag (ECN Echo)
-        features['ECE Flag Cnt'] = 1 if scapy_packet[TCP].flags.E else 0
+        features_dict['FIN Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.F else 0.0
+        features_dict['SYN Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.S else 0.0
+        features_dict['RST Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.R else 0.0
+        features_dict['PSH Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.P else 0.0
+        features_dict['ACK Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.A else 0.0
+        features_dict['URG Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.U else 0.0
+        features_dict['CWE Flag Count'] = 1.0 if scapy_packet[TCP].flags.C else 0.0
+        features_dict['ECE Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.E else 0.0
+        # Initial Window Bytes
+        features_dict['Init Fwd Win Byts'] = scapy_packet[TCP].window
 
-        # Initial Window Bytes (from TCP)
-        features['Init Fwd Win Byts'] = scapy_packet[TCP].window
+        # Fwd Act Data Pkts for TCP payload
+        features_dict['Fwd Act Data Pkts'] = 1.0 if scapy_packet[TCP].payload else 0.0
+        features_dict['Fwd Seg Size Min'] = len(
+            scapy_packet[TCP].payload) if scapy_packet[TCP].payload else 0.0  # Min segment size from this packet
 
     elif UDP in scapy_packet:
-        features['Dst Port'] = scapy_packet[UDP].dport
-        # Not in ML_FEATURE_COLUMNS, for internal logic only
-        features['Src Port'] = scapy_packet[UDP].sport
+        features_dict['Dst Port'] = scapy_packet[UDP].dport
+        # UDP does not have the flag or window features
+        # Assuming Fwd Act Data Pkts is 1 if UDP has payload
+        features_dict['Fwd Act Data Pkts'] = 1.0 if scapy_packet[UDP].payload else 0.0
+        features_dict['Fwd Seg Size Min'] = len(
+            scapy_packet[UDP].payload) if scapy_packet[UDP].payload else 0.0
 
     # Raw Payload Features
     if scapy_packet.haslayer(Raw):
-        payload = scapy_packet[Raw].load
+        payload_load = scapy_packet[Raw].load
         # Approx. packet size average for this packet
-        features['Pkt Size Avg'] = len(payload)
-        # features['payload_entropy'] = calculate_entropy(payload) # Requires calculate_entropy and math import
+        features_dict['Pkt Size Avg'] = len(payload_load)
+        # features_dict['payload_entropy'] = calculate_entropy(payload_load) # Add if you implement entropy, ensure 'payload_entropy' is in ML_FEATURE_COLUMNS if used for training
+        features_dict['TotLen Fwd Pkts'] = features_dict.get(
+            'TotLen Fwd Pkts', 0.0) + len(payload_load)  # Add payload length to total length
 
-    # --- Handle potential Inf/NaN values from original dataset context ---
-    # These might not appear for single packet features but are crucial if any calculations lead to them.
-    for col in features.index:
-        if features[col] == np.inf or features[col] == -np.inf:
-            features[col] = np.nan
-    features.fillna(0, inplace=True)  # Fill any NaNs with 0
+    # Down/Up Ratio (can only be known in context of a flow, set to 0 or 1 for single packet)
+    # Placeholder, for a single forward packet, ratio is not meaningful
+    features_dict['Down/Up Ratio'] = 0.0
+
+    # Fill other flow-based features which are 0 for a single packet
+    # These often include: Tot Bwd Pkts, TotLen Bwd Pkts, Bwd Pkt Len Max/Min/Mean/Std
+    # Fwd/Bwd Byts/b Avg, Pkts/b Avg, Blk Rate Avg, Init Bwd Win Byts
+    # Active/Idle Mean/Std/Max/Min
+    for col in features_dict.keys():
+        if col not in features_dict:  # Ensure no key errors if col not found, though dict comprehension above covers
+            features_dict[col] = 0.0
+
+    # Convert to pandas Series first to ensure correct feature names/order before converting to numpy
+    features_series = pd.Series(
+        features_dict, index=ML_FEATURE_COLUMNS, dtype=float)
+
+    # --- Replicate the NaN/Inf handling from training ---
+    features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
+    features_series.fillna(0.0, inplace=True)  # Fill any NaNs with 0.0
 
     # Return as a 2D numpy array (1 sample, N features)
-    return features.values.reshape(1, -1)
+    return features_series.values.reshape(1, -1)
 
 
-# --- Packet Handling Function ---
+# --- Packet Handling Function (rest of it unchanged) ---
 def packet_handler(pkt):
     current_time = time.time()
     try:
@@ -236,7 +273,6 @@ def packet_handler(pkt):
         print(
             f"[*] Detected IP fragment: ID={scapy_packet.id}, Offset={scapy_packet.frag}, Flags={scapy_packet.flags}")
 
-        # Remove any old, timed-out fragments first
         keys_to_remove = [k for k, v in FRAGMENT_BUFFER.items(
         ) if current_time - v['timestamp'] > FRAGMENT_TIMEOUT]
         for k in keys_to_remove:
@@ -250,12 +286,9 @@ def packet_handler(pkt):
                 'fragments': [], 'timestamp': current_time}
 
         FRAGMENT_BUFFER[frag_key]['fragments'].append(scapy_packet)
-        # Update timestamp
         FRAGMENT_BUFFER[frag_key]['timestamp'] = current_time
 
         if scapy_packet.frag == 0:
-            # Tiny Fragment Attack Detection: If first fragment is too small
-            # e.g., less than IP (20) + UDP (8) header size
             if scapy_packet.len < 28:
                 print(
                     f"BLOCKING (Fragmentation): Detected tiny first fragment (len={scapy_packet.len}) for ID {scapy_packet.id}.")
@@ -263,22 +296,19 @@ def packet_handler(pkt):
                 del FRAGMENT_BUFFER[frag_key]
                 return
 
-        # For fragmented packets, accept them for now to allow kernel reassembly.
-        # ML/DPI will be applied to reassembled packets (or full packets later).
         pkt.accept()
         return
 
     print(f"\n--- New Packet ({pkt.id}) ---")
     scapy_packet.show()
 
-    # Extract common network info (for both rule-based and ML)
     src_ip = scapy_packet[IP].src if IP in scapy_packet else "N/A"
     dst_ip = scapy_packet[IP].dst if IP in scapy_packet else "N/A"
     proto_num = scapy_packet[IP].proto if IP in scapy_packet else "N/A"
 
     src_port = None
     dst_port = None
-    proto_name = "N/A"  # Used for logging
+    proto_name = "N/A"
 
     if TCP in scapy_packet:
         src_port = scapy_packet[TCP].sport
@@ -368,11 +398,9 @@ def packet_handler(pkt):
     ml_prediction = "N/A"
     if RF_MODEL and LR_MODEL and SCALER:
         try:
-            # Extract features for ML model
             features_array = extract_ml_features(scapy_packet)
 
             # Predict with Random Forest
-            # [0] because predict returns an array
             rf_pred = RF_MODEL.predict(features_array)[0]
             rf_pred_label = "MALICIOUS" if rf_pred == 1 else "BENIGN"
 
@@ -401,10 +429,9 @@ def packet_handler(pkt):
     pkt.accept()
 
 
-# --- Main Firewall Execution Logic ---
+# --- Main Firewall Execution Logic (unchanged) ---
 def run_firewall():
-    # Load Scapy's TLS layer
-    from scapy.all import load_layer  # Import load_layer specifically here
+    from scapy.all import load_layer
     try:
         load_layer("tls")
         print("[*] Scapy TLS layer loaded successfully for JA3.")
@@ -412,7 +439,6 @@ def run_firewall():
         print(
             f"[-] Warning: Could not load Scapy TLS layer: {e}. TLS/JA3 features might not work correctly.")
 
-    # Load ML models and scaler
     load_ml_models()
 
     nfqueue = NetfilterQueue()
