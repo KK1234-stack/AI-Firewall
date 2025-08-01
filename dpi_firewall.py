@@ -1,29 +1,34 @@
-# dpi_firewall.py - Corrected extract_ml_features
-
-from netfilterqueue import NetfilterQueue
-from scapy.all import IP, TCP, UDP, Raw, IPv6
-from scapy.layers.tls.handshake import TLSClientHello
-from scapy.layers.tls.record import TLS
+import logging
+import os
 import re
 import hashlib
 import time
 import joblib
 import numpy as np
 import pandas as pd
-import math  # imported at the top level for calculate_entropy
-from config import BLOCKED_IPS, BLOCKED_PORTS, MALICIOUS_REGEX_PATTERNS, KNOWN_MALICIOUS_JA3_HASHES, FRAGMENT_TIMEOUT
+import math
+
+# --- Configuration ---
+from config import (
+    BLOCKED_IPS,
+    BLOCKED_PORTS,
+    MALICIOUS_REGEX_PATTERNS,
+    KNOWN_MALICIOUS_JA3_HASHES,
+    FRAGMENT_TIMEOUT
+)
+
+# --- NetfilterQueue and Scapy Imports ---
+from netfilterqueue import NetfilterQueue
+from scapy.all import IP, TCP, UDP, Raw, IPv6
+from scapy.layers.tls.handshake import TLSClientHello
+from scapy.layers.tls.record import TLS
 
 
-FRAGMENT_BUFFER = {}
-
-
-# --- ML Model Global Variables (Loaded at Firewall Startup) ---
+# --- ML Model Global Variables ---
 RF_MODEL = None
 LR_MODEL = None
 SCALER = None
 
-# This MUST be the exact list and order of features your ML models were trained on.
-# Copied directly from your train_firewall_model.py output.
 ML_FEATURE_COLUMNS = [
     'Dst Port', 'Protocol', 'Flow Duration', 'Tot Fwd Pkts', 'Tot Bwd Pkts', 'TotLen Fwd Pkts', 'TotLen Bwd Pkts',
     'Fwd Pkt Len Max', 'Fwd Pkt Len Min', 'Fwd Pkt Len Mean', 'Fwd Pkt Len Std', 'Bwd Pkt Len Max', 'Bwd Pkt Len Min',
@@ -38,8 +43,8 @@ ML_FEATURE_COLUMNS = [
     'Active Min', 'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
 ]
 
-# --- Helper Functions (unchanged) ---
 
+# --- Helper Functions ---
 
 def calculate_ja3_hash(tls_client_hello_layer):
     try:
@@ -75,7 +80,6 @@ def calculate_ja3_hash(tls_client_hello_layer):
         ja3_hash = hashlib.md5(final_ja3_string.encode('ascii')).hexdigest()
         return ja3_hash
     except Exception as e:
-        print(f"[-] Error in calculate_ja3_hash: {e}")
         return None
 
 
@@ -103,52 +107,36 @@ def load_ml_models():
         LR_MODEL = joblib.load(os.path.join(
             MODEL_DIR, 'logistic_regression_model.pkl'))
         SCALER = joblib.load(os.path.join(MODEL_DIR, 'scaler.pkl'))
-        print("[*] ML models and scaler loaded successfully.")
+        logging.info("ML models and scaler loaded successfully.")
     except Exception as e:
-        print(
-            f"[!] Error loading ML models: {e}. ML detection will be disabled.")
+        logging.error(
+            f"Error loading ML models: {e}. ML detection will be disabled.")
         RF_MODEL = None
         LR_MODEL = None
         SCALER = None
-
-# --- CRITICALLY UPDATED extract_ml_features function ---
 
 
 def extract_ml_features(scapy_packet):
     """
     Extracts numerical features from a Scapy packet, matching the format
-    expected by the trained ML models. This function must mirror the
-    preprocessing logic in train_firewall_model.py exactly.
-
-    Note: Many features are flow-based (e.g., Flow Duration, IATs, Tot Fwd Pkts).
-    For a single packet, these will be approximated or set to 0.0/1.0.
-    The model's accuracy on real-time single packets will depend on how
-    much it relies on these flow-based features vs. packet-level ones.
+    expected by the trained ML models.
     """
-    # Initialize all features to 0.0 using a Pandas Series for easy column management
     features_dict = {col: 0.0 for col in ML_FEATURE_COLUMNS}
 
-    # Extract IP-layer features
     if IP in scapy_packet:
         features_dict['Protocol'] = scapy_packet[IP].proto
         features_dict['Fwd Header Len'] = scapy_packet[IP].ihl * 4
         features_dict['Pkt Len Min'] = scapy_packet[IP].len
         features_dict['Pkt Len Max'] = scapy_packet[IP].len
         features_dict['Pkt Len Mean'] = scapy_packet[IP].len
-        features_dict['Pkt Len Std'] = 0.0
-        features_dict['Pkt Len Var'] = 0.0
-
-        # Simple single-packet approximations for flow-based counts/lengths
-        features_dict['Tot Fwd Pkts'] = 1.0  # This packet
-        features_dict['TotLen Fwd Pkts'] = scapy_packet[IP].len
         features_dict['Fwd Pkt Len Max'] = scapy_packet[IP].len
         features_dict['Fwd Pkt Len Min'] = scapy_packet[IP].len
         features_dict['Fwd Pkt Len Mean'] = scapy_packet[IP].len
 
-        # Initial window bytes are from TCP/UDP, other packet lengths are also based on payload
+        features_dict['Tot Fwd Pkts'] = 1.0
+        features_dict['TotLen Fwd Pkts'] = scapy_packet[IP].len
+        features_dict['Pkt Size Avg'] = scapy_packet[IP].len
 
-        # For flow duration and IATs, in a single-packet context, they are often 0 or very small
-        # The model was trained on dataset-derived flow durations, so these are approximations.
         features_dict['Flow Duration'] = 0.0
         features_dict['Flow IAT Mean'] = 0.0
         features_dict['Flow IAT Std'] = 0.0
@@ -164,14 +152,39 @@ def extract_ml_features(scapy_packet):
         features_dict['Bwd IAT Std'] = 0.0
         features_dict['Bwd IAT Max'] = 0.0
         features_dict['Bwd IAT Min'] = 0.0
-
-        # Other header lengths (Bwd Header Len) are 0 for a forward-only packet
         features_dict['Bwd Header Len'] = 0.0
+        features_dict['Tot Bwd Pkts'] = 0.0
+        features_dict['TotLen Bwd Pkts'] = 0.0
+        features_dict['Bwd Pkt Len Max'] = 0.0
+        features_dict['Bwd Pkt Len Min'] = 0.0
+        features_dict['Bwd Pkt Len Mean'] = 0.0
+        features_dict['Bwd Pkt Len Std'] = 0.0
+        features_dict['Down/Up Ratio'] = 0.0
+        features_dict['Fwd Byts/b Avg'] = 0.0
+        features_dict['Fwd Pkts/b Avg'] = 0.0
+        features_dict['Fwd Blk Rate Avg'] = 0.0
+        features_dict['Bwd Byts/b Avg'] = 0.0
+        features_dict['Bwd Pkts/b Avg'] = 0.0
+        features_dict['Bwd Blk Rate Avg'] = 0.0
+        features_dict['Init Bwd Win Byts'] = 0.0
+        features_dict['Active Mean'] = 0.0
+        features_dict['Active Std'] = 0.0
+        features_dict['Active Max'] = 0.0
+        features_dict['Active Min'] = 0.0
+        features_dict['Idle Mean'] = 0.0
+        features_dict['Idle Std'] = 0.0
+        features_dict['Idle Max'] = 0.0
+        features_dict['Idle Min'] = 0.0
+        features_dict['Fwd Pkt Len Std'] = 0.0
+        features_dict['Pkt Len Std'] = 0.0
+        features_dict['Pkt Len Var'] = 0.0
+        features_dict['Fwd Seg Size Avg'] = 0.0
+        features_dict['Bwd Seg Size Avg'] = 0.0
+        features_dict['Fwd Act Data Pkts'] = 0.0
+        features_dict['Fwd Seg Size Min'] = 0.0
 
-    # Extract TCP/UDP layer features
     if TCP in scapy_packet:
         features_dict['Dst Port'] = scapy_packet[TCP].dport
-        # TCP Flags
         features_dict['FIN Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.F else 0.0
         features_dict['SYN Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.S else 0.0
         features_dict['RST Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.R else 0.0
@@ -180,74 +193,47 @@ def extract_ml_features(scapy_packet):
         features_dict['URG Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.U else 0.0
         features_dict['CWE Flag Count'] = 1.0 if scapy_packet[TCP].flags.C else 0.0
         features_dict['ECE Flag Cnt'] = 1.0 if scapy_packet[TCP].flags.E else 0.0
-        # Initial Window Bytes
         features_dict['Init Fwd Win Byts'] = scapy_packet[TCP].window
-
-        # Fwd Act Data Pkts for TCP payload
-        features_dict['Fwd Act Data Pkts'] = 1.0 if scapy_packet[TCP].payload else 0.0
-        features_dict['Fwd Seg Size Min'] = len(
-            scapy_packet[TCP].payload) if scapy_packet[TCP].payload else 0.0  # Min segment size from this packet
+        if scapy_packet[TCP].payload:
+            features_dict['Fwd Act Data Pkts'] = 1.0
+            features_dict['Fwd Seg Size Min'] = len(scapy_packet[TCP].payload)
+            features_dict['Pkt Size Avg'] = len(scapy_packet[IP])
 
     elif UDP in scapy_packet:
         features_dict['Dst Port'] = scapy_packet[UDP].dport
-        # UDP does not have the flag or window features
-        # Assuming Fwd Act Data Pkts is 1 if UDP has payload
-        features_dict['Fwd Act Data Pkts'] = 1.0 if scapy_packet[UDP].payload else 0.0
-        features_dict['Fwd Seg Size Min'] = len(
-            scapy_packet[UDP].payload) if scapy_packet[UDP].payload else 0.0
+        if scapy_packet[UDP].payload:
+            features_dict['Fwd Act Data Pkts'] = 1.0
+            features_dict['Fwd Seg Size Min'] = len(scapy_packet[UDP].payload)
+            features_dict['Pkt Size Avg'] = len(scapy_packet[IP])
 
-    # Raw Payload Features
-    if scapy_packet.haslayer(Raw):
-        payload_load = scapy_packet[Raw].load
-        # Approx. packet size average for this packet
-        features_dict['Pkt Size Avg'] = len(payload_load)
-        # features_dict['payload_entropy'] = calculate_entropy(payload_load) # Add if you implement entropy, ensure 'payload_entropy' is in ML_FEATURE_COLUMNS if used for training
-        features_dict['TotLen Fwd Pkts'] = features_dict.get(
-            'TotLen Fwd Pkts', 0.0) + len(payload_load)  # Add payload length to total length
+    for key in features_dict:
+        features_dict[key] = float(features_dict[key])
 
-    # Down/Up Ratio (can only be known in context of a flow, set to 0 or 1 for single packet)
-    # Placeholder, for a single forward packet, ratio is not meaningful
-    features_dict['Down/Up Ratio'] = 0.0
-
-    # Fill other flow-based features which are 0 for a single packet
-    # These often include: Tot Bwd Pkts, TotLen Bwd Pkts, Bwd Pkt Len Max/Min/Mean/Std
-    # Fwd/Bwd Byts/b Avg, Pkts/b Avg, Blk Rate Avg, Init Bwd Win Byts
-    # Active/Idle Mean/Std/Max/Min
-    for col in features_dict.keys():
-        if col not in features_dict:  # Ensure no key errors if col not found, though dict comprehension above covers
-            features_dict[col] = 0.0
-
-    # Convert to pandas Series first to ensure correct feature names/order before converting to numpy
     features_series = pd.Series(
         features_dict, index=ML_FEATURE_COLUMNS, dtype=float)
 
-    # --- Replicate the NaN/Inf handling from training ---
     features_series.replace([np.inf, -np.inf], np.nan, inplace=True)
-    features_series.fillna(0.0, inplace=True)  # Fill any NaNs with 0.0
+    features_series.fillna(0.0, inplace=True)
 
-    # Return as a 2D numpy array (1 sample, N features)
     return features_series.values.reshape(1, -1)
 
 
-# --- Packet Handling Function (rest of it unchanged) ---
+# --- Packet Handling Function ---
 def packet_handler(pkt):
     current_time = time.time()
     try:
         scapy_packet = IP(pkt.get_payload())
     except Exception as e:
-        print(f"[-] Error parsing packet payload with Scapy: {e}")
+        logging.error(
+            f"Error parsing packet payload with Scapy: {e}. Accepting packet.")
         pkt.accept()
         return
 
     # --- Fragmentation Handling ---
     if scapy_packet.flags & 0x1 or scapy_packet.frag != 0:
-        print(
-            f"[*] Detected IP fragment: ID={scapy_packet.id}, Offset={scapy_packet.frag}, Flags={scapy_packet.flags}")
-
         keys_to_remove = [k for k, v in FRAGMENT_BUFFER.items(
         ) if current_time - v['timestamp'] > FRAGMENT_TIMEOUT]
         for k in keys_to_remove:
-            print(f"[-] Discarding timed-out fragments for ID: {k[2]}")
             del FRAGMENT_BUFFER[k]
 
         frag_key = (scapy_packet[IP].src,
@@ -261,17 +247,16 @@ def packet_handler(pkt):
 
         if scapy_packet.frag == 0:
             if scapy_packet.len < 28:
-                print(
+                logging.info(
                     f"BLOCKING (Fragmentation): Detected tiny first fragment (len={scapy_packet.len}) for ID {scapy_packet.id}.")
+                print(f"--- Packet Blocked by Fragmentation ({pkt.id}) ---")
+                scapy_packet.show()
                 pkt.drop()
                 del FRAGMENT_BUFFER[frag_key]
                 return
 
         pkt.accept()
         return
-
-    print(f"\n--- New Packet ({pkt.id}) ---")
-    scapy_packet.show()
 
     src_ip = scapy_packet[IP].src if IP in scapy_packet else "N/A"
     dst_ip = scapy_packet[IP].dst if IP in scapy_packet else "N/A"
@@ -295,23 +280,26 @@ def packet_handler(pkt):
         payload_bytes = scapy_packet[Raw].load
 
     # --- Phase 1: Basic IP and Port Filtering ---
-    if src_ip in BLOCKED_IPS:
-        print(f"BLOCKING (IP): Source IP {src_ip} is on the blacklist.")
-        pkt.drop()
-        return
-    if dst_ip in BLOCKED_IPS:
-        print(f"BLOCKING (IP): Destination IP {dst_ip} is on the blacklist.")
-        pkt.drop()
-        return
+    is_blocked_by_rule = False
+    block_reason = ""
 
-    if src_port in BLOCKED_PORTS and (proto_name == "TCP" or proto_name == "UDP"):
-        print(
-            f"BLOCKING (Port): Source {proto_name} Port {src_port} is on the blacklist.")
-        pkt.drop()
-        return
-    if dst_port in BLOCKED_PORTS and (proto_name == "TCP" or proto_name == "UDP"):
-        print(
-            f"BLOCKING (Port): Destination {proto_name} Port {dst_port} is on the blacklist.")
+    if src_ip in BLOCKED_IPS:
+        block_reason = f"IP: Source IP {src_ip} -> {dst_ip} is on the blacklist."
+        is_blocked_by_rule = True
+    elif dst_ip in BLOCKED_IPS:
+        block_reason = f"IP: Destination IP {src_ip} -> {dst_ip} is on the blacklist."
+        is_blocked_by_rule = True
+    elif src_port in BLOCKED_PORTS and (proto_name == "TCP" or proto_name == "UDP"):
+        block_reason = f"Port: Source {proto_name} Port {src_port} -> {dst_port} is on the blacklist."
+        is_blocked_by_rule = True
+    elif dst_port in BLOCKED_PORTS and (proto_name == "TCP" or proto_name == "UDP"):
+        block_reason = f"Port: Destination {proto_name} Port {src_port} -> {dst_port} is on the blacklist."
+        is_blocked_by_rule = True
+
+    if is_blocked_by_rule:
+        logging.info(f"BLOCKING ({block_reason})")
+        print(f"--- Packet Blocked by Rule ({pkt.id}) ---")
+        scapy_packet.show()
         pkt.drop()
         return
 
@@ -321,12 +309,15 @@ def packet_handler(pkt):
             decoded_payload = payload_bytes.decode('utf-8', errors='ignore')
             for pattern in MALICIOUS_REGEX_PATTERNS:
                 if pattern.search(decoded_payload):
-                    print(
+                    logging.info(
                         f"BLOCKING (DPI-Regex): Malicious pattern '{pattern.pattern}' detected in payload.")
+                    print(f"--- Packet Blocked by DPI-Regex ({pkt.id}) ---")
+                    scapy_packet.show()
                     pkt.drop()
                     return
         except Exception as e:
-            print(f"[-] Error decoding payload for regex search: {e}")
+            logging.error(
+                f"Error decoding payload for regex search: {e}. Accepting packet.")
 
     # --- Phase 2: DPI - Basic HTTP Payload Parsing ---
     if proto_name == "TCP" and (dst_port == 80 or src_port == 80):
@@ -334,81 +325,85 @@ def packet_handler(pkt):
             http_data = payload_bytes.decode('utf-8', errors='ignore')
             if http_data.startswith("GET ") or http_data.startswith("POST ") or \
                http_data.startswith("HTTP/"):
-                print("[*] Detected HTTP traffic.")
                 if "User-Agent: Nikto" in http_data:
-                    print("BLOCKING (DPI-HTTP): Detected Nikto User-Agent.")
+                    logging.info(
+                        "BLOCKING (DPI-HTTP): Detected Nikto User-Agent.")
+                    print(f"--- Packet Blocked by DPI-HTTP ({pkt.id}) ---")
+                    scapy_packet.show()
                     pkt.drop()
                     return
                 if "/admin/login.php?user=" in http_data and "password=" in http_data:
-                    print("BLOCKING (DPI-HTTP): Suspicious login attempt pattern.")
+                    logging.info(
+                        "BLOCKING (DPI-HTTP): Suspicious login attempt pattern.")
+                    print(f"--- Packet Blocked by DPI-HTTP ({pkt.id}) ---")
+                    scapy_packet.show()
                     pkt.drop()
                     return
         except Exception as e:
-            print(f"[-] Error parsing HTTP payload: {e}")
+            logging.error(
+                f"Error parsing HTTP payload: {e}. Accepting packet.")
 
     # --- Phase 2: DPI - JA3 TLS Fingerprinting ---
     if TLSClientHello in scapy_packet:
-        print("[*] Detected TLS Client Hello handshake.")
         try:
             ja3_hash = calculate_ja3_hash(scapy_packet[TLSClientHello])
             if ja3_hash:
-                print(f"[*] Calculated JA3 Hash: {ja3_hash}")
                 if ja3_hash in KNOWN_MALICIOUS_JA3_HASHES:
-                    print(
+                    logging.info(
                         f"BLOCKING (JA3): Detected known malicious JA3 hash: {ja3_hash}")
+                    print(f"--- Packet Blocked by JA3 ({pkt.id}) ---")
+                    scapy_packet.show()
                     pkt.drop()
                     return
-            else:
-                print("[-] JA3 hash calculation failed for this packet.")
         except Exception as e:
-            print(f"[-] Error in JA3 processing: {e}")
-    elif TLS in scapy_packet:
-        print("[*] Detected other TLS traffic.")
+            logging.error(f"Error in JA3 processing: {e}. Accepting packet.")
 
     # --- Phase 3: AI/ML Model Prediction ---
-    ml_prediction = "N/A"
+    ml_prediction_decision = False
     if RF_MODEL and LR_MODEL and SCALER:
         try:
             features_array = extract_ml_features(scapy_packet)
 
-            # Predict with Random Forest
             rf_pred = RF_MODEL.predict(features_array)[0]
-            rf_pred_label = "MALICIOUS" if rf_pred == 1 else "BENIGN"
+            lr_pred = LR_MODEL.predict(SCALER.transform(features_array))[0]
 
-            # Predict with Logistic Regression (requires scaling)
-            features_scaled = SCALER.transform(features_array)
-            lr_pred = LR_MODEL.predict(features_scaled)[0]
+            rf_pred_label = "MALICIOUS" if rf_pred == 1 else "BENIGN"
             lr_pred_label = "MALICIOUS" if lr_pred == 1 else "BENIGN"
 
-            print(f"[*] ML Prediction: RF={rf_pred_label}, LR={lr_pred_label}")
+            logging.info(
+                f"ML Prediction: RF={rf_pred_label}, LR={lr_pred_label} for packet {pkt.id} from {src_ip}:{src_port} to {dst_ip}:{dst_port}.")
 
-            # Define ML blocking policy: Block if either model predicts malicious
             if rf_pred == 1 or lr_pred == 1:
-                print(
-                    "BLOCKING (ML): At least one ML model predicted malicious traffic.")
+                ml_prediction_decision = True
+                logging.info(
+                    f"BLOCKING (ML): RF={rf_pred_label}, LR={lr_pred_label}")
+                print(f"--- Packet Blocked by ML ({pkt.id}) ---")
+                scapy_packet.show()
                 pkt.drop()
                 return
 
         except Exception as e:
-            print(f"[!] Error during ML prediction: {e}. Accepting packet.")
-            # If ML fails, default to accepting to avoid false positives
-    else:
-        print("[*] ML models not loaded or available. Skipping ML prediction.")
+            logging.error(
+                f"Error during ML prediction: {e}. Accepting packet.")
 
-    # If no blocking rules or ML predictions matched, accept the packet
-    print(f"ACCEPTING packet from {src_ip}:{src_port} to {dst_ip}:{dst_port}.")
     pkt.accept()
 
 
-# --- Main Firewall Execution Logic (unchanged) ---
+# --- Main Firewall Execution Logic ---
 def run_firewall():
+    logging.basicConfig(filename='firewall.log', level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.info(
+        "Firewall logging initialized. Logging all events to firewall.log")
+    print("[*] Console will show only critical BLOCKING events. See firewall.log for all details.")
+
     from scapy.all import load_layer
     try:
         load_layer("tls")
-        print("[*] Scapy TLS layer loaded successfully for JA3.")
+        logging.info("Scapy TLS layer loaded successfully for JA3.")
     except Exception as e:
-        print(
-            f"[-] Warning: Could not load Scapy TLS layer: {e}. TLS/JA3 features might not work correctly.")
+        logging.error(
+            f"Warning: Could not load Scapy TLS layer: {e}. TLS/JA3 features might not work correctly.")
 
     load_ml_models()
 
@@ -421,14 +416,19 @@ def run_firewall():
         print(
             "[*]                                sudo iptables -A OUTPUT -j NFQUEUE --queue-num 0")
         print("[*] Press Ctrl+C to stop.")
+        logging.info("AI-Enhanced DPI Firewall is now active.")
         nfqueue.run()
     except KeyboardInterrupt:
         print("\n[*] AI-Enhanced DPI Firewall stopped by user.")
+        logging.info("AI-Enhanced DPI Firewall stopped by user.")
     except Exception as e:
-        print(f"[!] An error occurred in main firewall loop: {e}")
+        print(f"An error occurred in main firewall loop: {e}")
+        logging.critical(
+            f"Critical error in main firewall loop: {e}", exc_info=True)
     finally:
         nfqueue.unbind()
         print("[*] NetfilterQueue unbound.")
+        logging.info("NetfilterQueue unbound. Firewall shut down cleanly.")
 
 
 if __name__ == "__main__":
